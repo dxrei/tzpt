@@ -3,7 +3,7 @@
 > 一个浮在游戏画面上的攻略视频控制器 —— 用鼠标侧键就能暂停 / 播放 B 站、抖音里的攻略视频，不用切窗口。
 
 <p align="center">
-  <img src="docs/screenshot-main.png" width="480" alt="主界面">
+  <img src="tzpt/1.png" width="480" alt="主界面">
 </p>
 
 <p align="center">

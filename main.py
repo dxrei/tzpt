@@ -10,11 +10,6 @@
 - 任务进度记录，关软件自动保存
 - 置顶、鼠标穿透、系统托盘
 - 退出程序时一并关闭由本软件打开的浏览器
-
-关键点：
-- CDP 长连接复用，不再每次按键都新建 WebSocket
-- 主 frame 主上下文优先，跨域 iframe / 小窗 / Shadow DOM 兜底
-- pynput 监听器看门狗，避免按键「用久了失效」
 """
 
 import os
@@ -86,21 +81,12 @@ CHROME_EXTRA_ARGS = [
 DEBOUNCE_MOUSE = 0.28
 DEBOUNCE_HOTKEY = 0.30
 
-FORBIDDEN_KEYS = {
-    keyboard.Key.esc,
-    keyboard.Key.ctrl,
-    keyboard.Key.ctrl_l,
-    keyboard.Key.ctrl_r,
-    keyboard.Key.alt,
-    keyboard.Key.alt_l,
-    keyboard.Key.alt_r,
-    keyboard.Key.alt_gr,
-    keyboard.Key.shift,
-    keyboard.Key.shift_l,
-    keyboard.Key.shift_r,
-    keyboard.Key.cmd,
-    keyboard.Key.cmd_l,
-    keyboard.Key.cmd_r,
+FORBIDDEN_KEY_NAMES = {
+    "esc",
+    "ctrl", "ctrl_l", "ctrl_r",
+    "alt", "alt_l", "alt_r", "alt_gr",
+    "shift", "shift_l", "shift_r",
+    "cmd", "cmd_l", "cmd_r",
 }
 
 DEFAULT_BIND_PLAY = "Mouse 5"
@@ -173,58 +159,40 @@ def fetch_debug_targets(retries=4, delay=0.25):
 
 
 # =====================================================================
-# 按键绑定工具
+# 按键工具
 # =====================================================================
 
 def key_to_string(key):
-    if isinstance(key, keyboard.Key):
-        if key in FORBIDDEN_KEYS:
+    try:
+        if isinstance(key, keyboard.Key):
+            name = getattr(key, "name", None)
+            if not name:
+                return None
+            if name.lower() in FORBIDDEN_KEY_NAMES:
+                return None
+            return name.upper()
+
+        if isinstance(key, keyboard.KeyCode):
+            ch = key.char
+            if ch:
+                return ch.upper()
+            vk = getattr(key, "vk", None)
+            if vk is not None and vk >= 0:
+                return f"VK{vk}"
             return None
-        name = getattr(key, "name", None)
-        if not name:
-            return None
-        return name.upper()
 
-    if isinstance(key, keyboard.KeyCode):
-        ch = key.char
-        if ch:
-            return ch.upper()
-        vk = getattr(key, "vk", None)
-        if vk is not None:
-            return f"VK{vk}"
+        if isinstance(key, mouse.Button):
+            name = getattr(key, "name", None) or str(key)
+            name = name.lower()
+            if name in ("x1", "x2"):
+                return f"Mouse {name.upper()}"
+            if name in ("left", "right", "middle"):
+                return f"Mouse {name.capitalize()}"
+            return f"Mouse {name}"
+
         return None
-
-    if isinstance(key, mouse.Button):
-        name = getattr(key, "name", None) or str(key)
-        name = name.lower()
-        if name in ("x1", "x2"):
-            return f"Mouse {name.upper()}"
-        if name in ("left", "right", "middle"):
-            return f"Mouse {name.capitalize()}"
-        return f"Mouse {name}"
-
-    return None
-
-
-def string_to_keyboard_key(s):
-    if not s:
+    except Exception:
         return None
-    if s.startswith("Mouse "):
-        return None
-    if s.startswith("F") and s[1:].isdigit():
-        fname = s.lower()
-        return getattr(keyboard.Key, fname, None)
-    if len(s) == 1:
-        return keyboard.KeyCode.from_char(s.lower())
-    lname = s.lower()
-    return getattr(keyboard.Key, lname, None)
-
-
-def string_to_mouse_button(s):
-    if not s or not s.startswith("Mouse "):
-        return None
-    name = s[6:].lower()
-    return getattr(mouse.Button, name, None)
 
 
 def format_key_display(s):
@@ -435,20 +403,22 @@ class CDPSession:
         return cid
 
     def evaluate_all_frames(self, expression, timeout=8.0):
+        """先主上下文，再遍历所有 frame。不再静默吞异常。"""
+        last_error = None
+
+        # 1) 主 frame 主上下文
         try:
             value = self.evaluate(expression, timeout=timeout)
             if isinstance(value, dict) and value.get("found"):
                 return value
-        except Exception:
-            pass
+        except Exception as exc:
+            last_error = exc
 
+        # 2) 遍历所有 frame
         try:
             frame_ids = self.list_frames()
         except Exception:
-            return None
-
-        if not frame_ids:
-            return None
+            frame_ids = []
 
         current = set(frame_ids)
         for fid in list(self._contexts.keys()):
@@ -464,15 +434,19 @@ class CDPSession:
                 value = self.evaluate(expression, context_id=cid, timeout=timeout)
                 if isinstance(value, dict) and value.get("found"):
                     return value
-            except Exception:
+            except Exception as exc:
+                last_error = exc
                 self._contexts.pop(fid, None)
                 continue
+
+        if last_error is not None:
+            raise last_error
 
         return None
 
 
 # =====================================================================
-# JS 脚本
+# JS 脚本（关键修复：用 (function() { ... })() 包裹）
 # =====================================================================
 
 _JS_FIND_VIDEO = r"""
@@ -551,7 +525,7 @@ _JS_FIND_VIDEO = r"""
 """
 
 
-PLAY_PAUSE_JS = "(" + _JS_FIND_VIDEO + r"""
+PLAY_PAUSE_JS = "(function() {" + _JS_FIND_VIDEO + r"""
     var action;
     var detail = '';
     var wasPaused = video.paused;
@@ -588,7 +562,7 @@ PLAY_PAUSE_JS = "(" + _JS_FIND_VIDEO + r"""
 """
 
 
-FORWARD_JS_TEMPLATE = "(" + _JS_FIND_VIDEO + r"""
+FORWARD_JS_TEMPLATE = "(function() {" + _JS_FIND_VIDEO + r"""
     var seconds = __SECONDS__;
     var oldTime = video.currentTime;
     var newTime = Math.min(oldTime + seconds, video.duration || (oldTime + seconds));
@@ -642,7 +616,6 @@ class Overlay(QWidget):
         self.chrome_process = None
         self.target_url = ""
 
-        # 按键绑定：先读新字段，读不到就迁移旧字段
         self.bind_play = SETTINGS.value("bind_play", "")
         if not self.bind_play:
             old_side = SETTINGS.value("side_button", DEFAULT_BIND_PLAY)
@@ -1111,61 +1084,85 @@ class Overlay(QWidget):
     # 按键匹配
     # -----------------------------------------------------------------
 
-    def _keyboard_matches(self, bind_string, key):
-        if not bind_string or bind_string.startswith("Mouse "):
+    def _key_matches_binding(self, key, binding):
+        if not binding:
             return False
-        target = string_to_keyboard_key(bind_string)
-        if target is None:
-            return False
-        if isinstance(target, keyboard.Key):
-            return key == target
-        if isinstance(target, keyboard.KeyCode):
-            return (
-                isinstance(key, keyboard.KeyCode)
-                and key.char
-                and key.char.upper() == (target.char or "").upper()
-            )
-        return False
+        try:
+            if binding.startswith("Mouse "):
+                return False
 
-    def _mouse_matches(self, bind_string, button):
-        if not bind_string or not bind_string.startswith("Mouse "):
+            if isinstance(key, keyboard.Key):
+                name = getattr(key, "name", None)
+                if not name:
+                    return False
+                return name.upper() == binding.upper()
+
+            if isinstance(key, keyboard.KeyCode):
+                if binding.startswith("VK"):
+                    try:
+                        return int(binding[2:]) == getattr(key, "vk", None)
+                    except Exception:
+                        return False
+
+                ch = key.char
+                if not ch:
+                    return False
+                return ch.upper() == binding.upper()
+
             return False
-        target = string_to_mouse_button(bind_string)
-        if target is None:
+        except Exception:
             return False
-        return button == target
+
+    def _mouse_matches_binding(self, button, binding):
+        if not binding or not binding.startswith("Mouse "):
+            return False
+        try:
+            name = getattr(button, "name", None)
+            if name is None:
+                name = str(button)
+            target = binding[6:]
+            return name.lower() == target.lower()
+        except Exception:
+            return False
 
     def on_global_mouse_click(self, x, y, button, pressed):
-        if not pressed:
-            return
-
-        if self._binding_action is not None:
-            result = key_to_string(button)
-            if result is None:
-                return
-            self.signals.bind_captured.emit(result)
-            return
-
-        now = time.time()
-
-        if self._mouse_matches(self.bind_play, button):
-            if now - self._last_play_time >= DEBOUNCE_MOUSE:
-                self._last_play_time = now
-                self.signals.toggle_play.emit()
+        try:
+            if not pressed:
                 return
 
-        if self._mouse_matches(self.bind_forward, button):
-            if now - self._last_forward_time >= DEBOUNCE_MOUSE:
-                self._last_forward_time = now
-                self.signals.toggle_forward.emit()
+            if self._binding_action is not None:
+                result = key_to_string(button)
+                if result is None:
+                    return
+                self.signals.bind_captured.emit(result)
                 return
+
+            now = time.time()
+
+            if self._mouse_matches_binding(button, self.bind_play):
+                if now - self._last_play_time >= DEBOUNCE_MOUSE:
+                    self._last_play_time = now
+                    self.signals.toggle_play.emit()
+                    return
+
+            if self._mouse_matches_binding(button, self.bind_forward):
+                if now - self._last_forward_time >= DEBOUNCE_MOUSE:
+                    self._last_forward_time = now
+                    self.signals.toggle_forward.emit()
+                    return
+        except Exception:
+            pass
 
     def on_global_key(self, key):
         try:
             if self._binding_action is not None:
-                if key == keyboard.Key.esc:
-                    self.signals.bind_captured.emit("")
-                    return
+                try:
+                    if key == keyboard.Key.esc:
+                        self.signals.bind_captured.emit("")
+                        return
+                except Exception:
+                    pass
+
                 result = key_to_string(key)
                 if result is None:
                     return
@@ -1174,13 +1171,13 @@ class Overlay(QWidget):
 
             now = time.time()
 
-            if self._keyboard_matches(self.bind_play, key):
+            if self._key_matches_binding(key, self.bind_play):
                 if now - self._last_play_time >= DEBOUNCE_HOTKEY:
                     self._last_play_time = now
                     self.signals.toggle_play.emit()
                     return
 
-            if self._keyboard_matches(self.bind_forward, key):
+            if self._key_matches_binding(key, self.bind_forward):
                 if now - self._last_forward_time >= DEBOUNCE_HOTKEY:
                     self._last_forward_time = now
                     self.signals.toggle_forward.emit()
@@ -1463,6 +1460,7 @@ class Overlay(QWidget):
                     ordered.append(p)
 
                 last_result = None
+                last_error = None
 
                 for target in ordered:
                     ws_url = target.get("webSocketDebuggerUrl")
@@ -1472,7 +1470,8 @@ class Overlay(QWidget):
                     session = self._get_session(ws_url)
                     try:
                         result = session.evaluate_all_frames(expression)
-                    except Exception:
+                    except Exception as exc:
+                        last_error = exc
                         result = None
 
                     if isinstance(result, dict) and result.get("found"):
@@ -1480,16 +1479,22 @@ class Overlay(QWidget):
                         break
 
                 if last_result is None:
-                    self.signals.status.emit(
-                        f"{success_message}：没有找到 HTML5 视频元素。"
-                    )
+                    if last_error is not None:
+                        self.signals.status.emit(
+                            f"{success_message}：失败 {type(last_error).__name__}: "
+                            f"{str(last_error)[:160]}"
+                        )
+                    else:
+                        self.signals.status.emit(
+                            f"{success_message}：没有找到 HTML5 视频元素。"
+                        )
                     return
 
                 self.signals.status.emit(f"{success_message}：{formatter(last_result)}")
 
             except Exception as exc:
                 self.signals.status.emit(
-                    f"控制失败：{exc}。请先打开网页并等待视频加载。"
+                    f"控制失败：{type(exc).__name__}: {str(exc)[:160]}"
                 )
 
         threading.Thread(target=worker, daemon=True).start()
